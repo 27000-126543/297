@@ -47,4 +47,24 @@ router.get('/treatment-plants/:id/distributions', async (req, res) => {
   }
 });
 
+router.put('/schedule-instructions/:id/confirm', async (req, res) => {
+  try {
+    const result = await loadService.confirmInstruction(req.params.id);
+    if (!result) return res.status(404).json({ code: -1, message: '指令不存在或状态不允许确认', data: null });
+    res.json({ code: 0, message: 'success', data: result });
+  } catch (error) {
+    res.status(500).json({ code: -1, message: error.message, data: null });
+  }
+});
+
+router.put('/schedule-instructions/:id/reject', async (req, res) => {
+  try {
+    const result = await loadService.rejectInstruction(req.params.id, req.body.rejectReason);
+    if (!result) return res.status(404).json({ code: -1, message: '指令不存在或状态不允许拒绝', data: null });
+    res.json({ code: 0, message: 'success', data: result });
+  } catch (error) {
+    res.status(500).json({ code: -1, message: error.message, data: null });
+  }
+});
+
 module.exports = router;

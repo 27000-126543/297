@@ -85,6 +85,9 @@ const LoadDistribution = sequelize.define('LoadDistribution', {
   transferredLoad: { type: DataTypes.FLOAT },
   reason: { type: DataTypes.STRING },
   status: { type: DataTypes.STRING },
+  confirmedAt: { type: DataTypes.DATE },
+  rejectReason: { type: DataTypes.STRING },
+  finalTransferredLoad: { type: DataTypes.FLOAT },
   createdAt: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
 });
 
@@ -138,6 +141,9 @@ const InspectionOrder = sequelize.define('InspectionOrder', {
   dueTime: { type: DataTypes.DATE },
   completedAt: { type: DataTypes.DATE },
   escalationLevel: { type: DataTypes.INTEGER },
+  fieldCondition: { type: DataTypes.TEXT },
+  handlingResult: { type: DataTypes.TEXT },
+  handlingPhotos: { type: DataTypes.JSON },
   createdAt: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
   updatedAt: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
 });
@@ -230,6 +236,8 @@ const ScheduleInstruction = sequelize.define('ScheduleInstruction', {
   parameters: { type: DataTypes.JSON },
   reason: { type: DataTypes.STRING },
   status: { type: DataTypes.STRING },
+  confirmedAt: { type: DataTypes.DATE },
+  rejectReason: { type: DataTypes.STRING },
   executedAt: { type: DataTypes.DATE },
   createdAt: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
 });

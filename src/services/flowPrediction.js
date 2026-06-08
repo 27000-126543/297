@@ -16,15 +16,18 @@ async function predictFlow(district) {
   const stations = await db.PumpStation.findAll({ where: { district } });
   const stationIds = stations.map((s) => s.id);
 
+  const totalCapacity = stations.reduce((sum, s) => sum + (s.capacity || 0), 0);
+  const rainfallForecast = await getRainfallForecast(district);
+  const totalMM = rainfallForecast.totalMM;
+
   if (stationIds.length === 0) {
-    const rainfallForecast = await getRainfallForecast(district);
     const prediction = await db.FlowPrediction.create({
       district,
       predictedPeakFlow: 0,
       predictedPeakTime: null,
       rainfallForecast,
       confidence: 0,
-      modelVersion: 'v1.0',
+      modelVersion: 'v1.1',
     });
     return { ...prediction.toJSON(), sampleSize: 0, confidenceNote: '该片区无泵站数据，无法进行有效预测' };
   }
@@ -37,11 +40,8 @@ async function predictFlow(district) {
   });
 
   const sampleSize = stationData.length;
-  const rainfallForecast = await getRainfallForecast(district);
-  const totalMM = rainfallForecast.totalMM;
 
   if (sampleSize === 0) {
-    const totalCapacity = stations.reduce((sum, s) => sum + (s.capacity || 0), 0);
     const estimatedFlow = totalCapacity * 0.5;
     const prediction = await db.FlowPrediction.create({
       district,
@@ -49,56 +49,90 @@ async function predictFlow(district) {
       predictedPeakTime: null,
       rainfallForecast,
       confidence: 0.1,
-      modelVersion: 'v1.0',
+      modelVersion: 'v1.1',
     });
     return { ...prediction.toJSON(), sampleSize: 0, confidenceNote: '该片区无历史流量数据，预测值基于站点总容量的50%估算，置信度极低' };
   }
 
-  const hourlyFlow = {};
-  for (const record of stationData) {
-    const hour = new Date(record.timestamp).getHours();
-    if (!hourlyFlow[hour]) hourlyFlow[hour] = [];
-    hourlyFlow[hour].push(record.flow || 0);
+  const validFlows = stationData.map((r) => r.flow || 0).filter((f) => f > 0);
+  const nonZeroCount = validFlows.length;
+  const zeroCount = sampleSize - nonZeroCount;
+
+  let sampleMeanFlow = 0;
+  let sampleMaxFlow = 0;
+  if (validFlows.length > 0) {
+    sampleMeanFlow = validFlows.reduce((a, b) => a + b, 0) / validFlows.length;
+    sampleMaxFlow = Math.max(...validFlows);
   }
 
-  const hourlyAvg = {};
-  for (const hour in hourlyFlow) {
-    const arr = hourlyFlow[hour];
-    hourlyAvg[hour] = arr.reduce((a, b) => a + b, 0) / arr.length;
-  }
+  let peakEstimate;
+  let estimationMethod;
 
-  let baseFlow = 0;
-  const hourCount = Object.keys(hourlyAvg).length;
-  if (hourCount === 0) {
-    const totalCapacity = stations.reduce((sum, s) => sum + (s.capacity || 0), 0);
-    baseFlow = totalCapacity * 0.5;
-  } else {
-    for (const hour in hourlyAvg) {
-      baseFlow += hourlyAvg[hour];
+  if (sampleSize < 24) {
+    const capacityBased = totalCapacity * 0.6;
+    const dataBased = sampleMeanFlow * 1.8;
+    const maxBased = sampleMaxFlow * 1.3;
+    peakEstimate = Math.max(capacityBased * 0.4, dataBased, maxBased, capacityBased * 0.3);
+    estimationMethod = 'sparse_sample';
+  } else if (sampleSize < 168) {
+    const hourlyFlow = {};
+    for (const record of stationData) {
+      const hour = new Date(record.timestamp).getHours();
+      if (!hourlyFlow[hour]) hourlyFlow[hour] = [];
+      hourlyFlow[hour].push(record.flow || 0);
     }
-    baseFlow = baseFlow / 24;
+    const hourlyPeakAvgs = {};
+    for (const hour in hourlyFlow) {
+      const arr = hourlyFlow[hour];
+      hourlyPeakAvgs[hour] = arr.reduce((a, b) => a + b, 0) / arr.length;
+    }
+    const observedPeak = Math.max(...Object.values(hourlyPeakAvgs));
+    const coverageRatio = Object.keys(hourlyPeakAvgs).length / 24;
+    const adjustedPeak = observedPeak / Math.max(coverageRatio, 0.3);
+    peakEstimate = Math.max(adjustedPeak, sampleMeanFlow * 1.5, totalCapacity * 0.4);
+    estimationMethod = 'partial_hourly';
+  } else {
+    const hourlyFlow = {};
+    for (const record of stationData) {
+      const hour = new Date(record.timestamp).getHours();
+      if (!hourlyFlow[hour]) hourlyFlow[hour] = [];
+      hourlyFlow[hour].push(record.flow || 0);
+    }
+    const hourlyPeakAvgs = {};
+    for (const hour in hourlyFlow) {
+      const arr = hourlyFlow[hour];
+      hourlyPeakAvgs[hour] = arr.reduce((a, b) => a + b, 0) / arr.length;
+    }
+    peakEstimate = Math.max(...Object.values(hourlyPeakAvgs));
+    if (peakEstimate <= 0) {
+      peakEstimate = Math.max(sampleMeanFlow * 1.5, totalCapacity * 0.4);
+    }
+    estimationMethod = 'full_hourly';
   }
 
-  const predictedPeakFlow = baseFlow * (1 + totalMM * 0.015);
-  if (predictedPeakFlow <= 0) {
-    const totalCapacity = stations.reduce((sum, s) => sum + (s.capacity || 0), 0);
-    const fallback = totalCapacity * 0.4 * (1 + totalMM * 0.015);
-    const prediction = await db.FlowPrediction.create({
-      district,
-      predictedPeakFlow: fallback,
-      predictedPeakTime: null,
-      rainfallForecast,
-      confidence: 0.1,
-      modelVersion: 'v1.0',
-    });
-    return { ...prediction.toJSON(), sampleSize, confidenceNote: '历史流量数据计算结果为零，已使用站点容量40%作为估算基准，置信度极低' };
-  }
+  const rainfallCoefficient = 1 + totalMM * 0.015;
+  const predictedPeakFlow = peakEstimate * rainfallCoefficient;
 
   let peakHour = 8;
-  const morningAvg = ((hourlyAvg[8] || 0) + (hourlyAvg[9] || 0) + (hourlyAvg[10] || 0)) / (hourlyAvg[8] !== undefined ? 1 : 0) || 0.001;
-  const eveningAvg = ((hourlyAvg[18] || 0) + (hourlyAvg[19] || 0) + (hourlyAvg[20] || 0)) / (hourlyAvg[18] !== undefined ? 1 : 0) || 0.001;
-  if (eveningAvg > morningAvg) {
-    peakHour = 18;
+  if (sampleSize >= 24) {
+    const hourlyFlow = {};
+    for (const record of stationData) {
+      const hour = new Date(record.timestamp).getHours();
+      if (!hourlyFlow[hour]) hourlyFlow[hour] = [];
+      hourlyFlow[hour].push(record.flow || 0);
+    }
+    const hourlyPeakAvgs = {};
+    for (const hour in hourlyFlow) {
+      const arr = hourlyFlow[hour];
+      hourlyPeakAvgs[hour] = arr.reduce((a, b) => a + b, 0) / arr.length;
+    }
+    let maxHourFlow = 0;
+    for (const hour in hourlyPeakAvgs) {
+      if (hourlyPeakAvgs[hour] > maxHourFlow) {
+        maxHourFlow = hourlyPeakAvgs[hour];
+        peakHour = parseInt(hour, 10);
+      }
+    }
   }
   if (totalMM > 30) {
     peakHour = peakHour + 2;
@@ -113,21 +147,26 @@ async function predictFlow(district) {
   let confidenceNote;
   if (sampleSize < 24) {
     confidence = 0.2;
-    confidenceNote = `数据样本量仅${sampleSize}条，不足1天完整数据，预测结果参考价值有限`;
+    confidenceNote = `数据样本量仅${sampleSize}条(非零${nonZeroCount}条)，不足1天完整数据，采用容量+均值综合估算，预测结果参考价值有限`;
   } else if (sampleSize < 168) {
-    confidence = Math.max(0.3, 0.5 - (1 / sampleSize) * 10);
-    confidenceNote = `数据样本量${sampleSize}条，不足1周完整数据，预测置信度较低`;
+    confidence = Math.max(0.3, Math.min(0.55, 0.35 + sampleSize / 600));
+    confidenceNote = `数据样本量${sampleSize}条(非零${nonZeroCount}条)，不足1周完整数据，${estimationMethod === 'partial_hourly' ? '按小时覆盖率修正峰值' : '均值估算'}，置信度较低`;
   } else if (sampleSize < 720) {
-    confidence = Math.max(0.5, Math.min(0.75, 0.6 + (sampleSize / 2000)));
-    confidenceNote = `数据样本量${sampleSize}条，预测置信度中等`;
+    confidence = Math.max(0.55, Math.min(0.8, 0.6 + sampleSize / 2000));
+    confidenceNote = `数据样本量${sampleSize}条(非零${nonZeroCount}条)，按完整小时分布计算峰值，置信度中等`;
   } else {
-    confidence = Math.max(0.7, Math.min(0.95, 0.8 + (sampleSize / 5000) * 0.1));
-    confidenceNote = `数据样本量${sampleSize}条，预测置信度较高`;
+    confidence = Math.max(0.75, Math.min(0.95, 0.8 + sampleSize / 5000 * 0.1));
+    confidenceNote = `数据样本量${sampleSize}条(非零${nonZeroCount}条)，数据充分，按完整小时分布计算峰值，置信度较高`;
   }
 
   if (totalMM > 50) {
     confidence = Math.max(0.1, confidence - 0.15);
     confidenceNote += '；强降雨预报增加了不确定性';
+  }
+
+  if (zeroCount > sampleSize * 0.5 && sampleSize > 0) {
+    confidence = Math.max(0.1, confidence - 0.1);
+    confidenceNote += `；${Math.round(zeroCount / sampleSize * 100)}%记录流量为零，数据质量偏低`;
   }
 
   const prediction = await db.FlowPrediction.create({
@@ -136,12 +175,12 @@ async function predictFlow(district) {
     predictedPeakTime: tomorrow,
     rainfallForecast,
     confidence,
-    modelVersion: 'v1.0',
+    modelVersion: 'v1.1',
   });
 
   await generateScheduleInstructions(prediction);
 
-  return { ...prediction.toJSON(), sampleSize, confidenceNote };
+  return { ...prediction.toJSON(), sampleSize, nonZeroCount, estimationMethod, confidenceNote };
 }
 
 async function generateScheduleInstructions(prediction) {

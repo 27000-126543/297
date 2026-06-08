@@ -133,7 +133,7 @@ async function redistributeLoad(plantId, reason, incomingWaterVolume = 0) {
       fromPlantId: plantId,
       transferredLoad: share,
       reason,
-      status: 'active',
+      status: 'pending',
     });
 
     await db.ScheduleInstruction.create({
@@ -234,6 +234,146 @@ async function getLoadDistributionHistory(plantId, options = {}) {
   return { total: count, page, pageSize, data: enriched };
 }
 
+async function confirmInstruction(instructionId) {
+  const instruction = await db.ScheduleInstruction.findByPk(instructionId);
+  if (!instruction) return null;
+  if (instruction.status !== 'pending') return null;
+
+  await instruction.update({
+    status: 'confirmed',
+    confirmedAt: new Date(),
+  });
+
+  if (instruction.instructionType === 'load_transfer' && instruction.plantId) {
+    const distributions = await db.LoadDistribution.findAll({
+      where: { plantId: instruction.plantId, status: 'pending' },
+    });
+    for (const dist of distributions) {
+      await dist.update({
+        status: 'confirmed',
+        confirmedAt: new Date(),
+        finalTransferredLoad: dist.transferredLoad,
+      });
+    }
+  }
+
+  pushNotification('supervisor', 'instruction_confirmed', {
+    instructionId,
+    plantId: instruction.plantId,
+    instructionType: instruction.instructionType,
+  });
+
+  return instruction;
+}
+
+async function rejectInstruction(instructionId, rejectReason) {
+  const instruction = await db.ScheduleInstruction.findByPk(instructionId);
+  if (!instruction) return null;
+  if (instruction.status !== 'pending') return null;
+
+  await instruction.update({
+    status: 'rejected',
+    rejectReason: rejectReason || '未说明原因',
+  });
+
+  const rejectedPlantId = instruction.plantId;
+  const rejectedLoad = instruction.parameters?.transferredLoad || 0;
+  const fromPlantId = instruction.parameters?.fromPlantId;
+
+  const relatedDistributions = await db.LoadDistribution.findAll({
+    where: { plantId: rejectedPlantId, fromPlantId, status: 'pending' },
+  });
+  for (const dist of relatedDistributions) {
+    await dist.update({
+      status: 'rejected',
+      rejectReason: rejectReason || '未说明原因',
+    });
+  }
+
+  const rejectedPlant = await db.TreatmentPlant.findByPk(rejectedPlantId);
+  if (rejectedPlant && rejectedLoad > 0) {
+    rejectedPlant.currentLoad = Math.max(0, rejectedPlant.currentLoad - rejectedLoad);
+    await rejectedPlant.save();
+  }
+
+  if (fromPlantId) {
+    await retryLoadRedistribution(fromPlantId, rejectedLoad, rejectedPlantId, rejectReason);
+  }
+
+  pushNotification('supervisor', 'instruction_rejected', {
+    instructionId,
+    plantId: rejectedPlantId,
+    rejectReason,
+    retryAttempted: !!fromPlantId,
+  });
+
+  return instruction;
+}
+
+async function retryLoadRedistribution(fromPlantId, rejectedLoad, excludePlantId, originalReason) {
+  const overloadedPlant = await db.TreatmentPlant.findByPk(fromPlantId);
+  if (!overloadedPlant) return;
+
+  let allPlants = await db.TreatmentPlant.findAll({
+    where: {
+      id: {
+        [db.Sequelize.Op.ne]: fromPlantId,
+        [db.Sequelize.Op.notIn]: [excludePlantId],
+      },
+    },
+  });
+
+  let availablePlants = allPlants.filter(
+    (p) => p.currentLoad < p.designCapacity * 0.85
+  );
+
+  let districtPlants = availablePlants.filter((p) => p.district === overloadedPlant.district);
+  if (districtPlants.length > 0) {
+    availablePlants = districtPlants;
+  }
+
+  if (availablePlants.length === 0) return;
+
+  const totalAvailable = availablePlants.reduce(
+    (sum, p) => sum + (p.designCapacity * 0.85 - p.currentLoad),
+    0
+  );
+  if (totalAvailable <= 0) return;
+
+  const actualTransfer = Math.min(rejectedLoad, totalAvailable);
+
+  for (const plant of availablePlants) {
+    const available = plant.designCapacity * 0.85 - plant.currentLoad;
+    const share = (available / totalAvailable) * actualTransfer;
+
+    await db.LoadDistribution.create({
+      plantId: plant.id,
+      fromPlantId,
+      transferredLoad: share,
+      reason: `retry_after_rejection: ${originalReason || '原接受方拒绝'}`,
+      status: 'pending',
+    });
+
+    await db.ScheduleInstruction.create({
+      plantId: plant.id,
+      instructionType: 'load_transfer',
+      parameters: { transferredLoad: share, fromPlantId, fromPlantName: overloadedPlant.name, toPlantName: plant.name, isRetry: true },
+      reason: `retry_after_rejection: ${originalReason || '原接受方拒绝'}`,
+      status: 'pending',
+    });
+
+    await plant.update({ currentLoad: plant.currentLoad + share });
+  }
+
+  pushNotification('operator', 'load_redistribution_retry', {
+    fromPlantId,
+    fromPlantName: overloadedPlant.name,
+    transferredLoad: actualTransfer,
+    toPlants: availablePlants.map((p) => ({ id: p.id, name: p.name })),
+    reason: originalReason,
+  });
+}
+
 module.exports = {
   reportInfluentData,
   reportEffluentData,
@@ -241,4 +381,6 @@ module.exports = {
   getPlantStatus,
   listTreatmentPlants,
   getLoadDistributionHistory,
+  confirmInstruction,
+  rejectInstruction,
 };

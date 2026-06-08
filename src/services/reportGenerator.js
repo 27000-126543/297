@@ -3,6 +3,32 @@ const path = require('path');
 const fs = require('fs');
 const ExcelJS = require('exceljs');
 
+function matchDischargeDistrict(discharge, district) {
+  const address = discharge.address || '';
+  if (address.includes(district)) return true;
+
+  const location = discharge.location;
+  if (location && location.lat && location.lng) {
+    return isLocationInDistrict(location.lat, location.lng, district);
+  }
+
+  if (discharge.reporter && discharge.reporter.district === district) return true;
+
+  return false;
+}
+
+function isLocationInDistrict(lat, lng, district) {
+  const DISTRICT_BOUNDS = {
+    '东区': { minLat: 30.5, maxLat: 30.7, minLng: 104.0, maxLng: 104.2 },
+    '西区': { minLat: 30.5, maxLat: 30.7, minLng: 103.8, maxLng: 104.0 },
+    '南区': { minLat: 30.3, maxLat: 30.5, minLng: 103.9, maxLng: 104.1 },
+    '北区': { minLat: 30.7, maxLat: 30.9, minLng: 103.9, maxLng: 104.1 },
+  };
+  const bounds = DISTRICT_BOUNDS[district];
+  if (!bounds) return false;
+  return lat >= bounds.minLat && lat <= bounds.maxLat && lng >= bounds.minLng && lng <= bounds.maxLng;
+}
+
 async function generateDailyReport(reportDate, district) {
   let date = reportDate ? new Date(reportDate) : new Date();
   if (!reportDate) {
@@ -72,18 +98,29 @@ async function generateDailyReport(reportDate, district) {
     pipelineFaultResponseTime = totalResponseTime / completedOrders.length / (1000 * 60);
   }
 
-  const illegalDischargeCases = await db.IllegalDischarge.count({
+  const allDischarges = await db.IllegalDischarge.findAll({
     where: {
       createdAt: { [db.Sequelize.Op.gte]: dayStart, [db.Sequelize.Op.lte]: dayEnd },
     },
-    include: [{
-      model: db.User,
-      as: 'reporter',
-      where: { district },
-      required: true,
-      attributes: [],
-    }],
+    include: [
+      { model: db.User, as: 'reporter', attributes: ['id', 'name', 'district'] },
+    ],
   });
+
+  const illegalDischargeCases = allDischarges.filter((d) => {
+    return matchDischargeDistrict(d, district);
+  }).length;
+
+  const illegalDischargeDetails = allDischarges.filter((d) => {
+    return matchDischargeDistrict(d, district);
+  }).map((d) => ({
+    id: d.id,
+    address: d.address,
+    coordinates: d.coordinates,
+    description: d.description,
+    status: d.status,
+    reporterDistrict: d.reporter?.district,
+  }));
 
   const details = {
     pumpEnergy: {
@@ -110,6 +147,7 @@ async function generateDailyReport(reportDate, district) {
     },
     illegalDischarge: {
       total: illegalDischargeCases,
+      cases: illegalDischargeDetails,
     },
   };
 
@@ -234,6 +272,20 @@ async function exportReportToExcel(reportId) {
   const illegalDetails = report.details?.illegalDischarge || {};
   illegalSheet.addRow({ metric: '案件总数', value: illegalDetails.total || 0 });
 
+  if (illegalDetails.cases && illegalDetails.cases.length > 0) {
+    const caseListSheet = workbook.addWorksheet('非法排污明细');
+    caseListSheet.columns = [
+      { header: '案件ID', key: 'id', width: 10 },
+      { header: '地址', key: 'address', width: 30 },
+      { header: '坐标', key: 'coordinates', width: 20 },
+      { header: '描述', key: 'description', width: 30 },
+      { header: '状态', key: 'status', width: 12 },
+    ];
+    for (const c of illegalDetails.cases) {
+      caseListSheet.addRow(c);
+    }
+  }
+
   await workbook.xlsx.writeFile(filePath);
 
   await report.update({ fileUrl: filePath });
@@ -349,6 +401,27 @@ async function exportReportsBatch(options = {}) {
       reportDate: new Date(report.reportDate).toISOString().split('T')[0],
       total: illegal.total || 0,
     });
+  }
+
+  const caseListSheet = workbook.addWorksheet('非法排污明细');
+  caseListSheet.columns = [
+    { header: '报告日期', key: 'reportDate', width: 15 },
+    { header: '区域', key: 'district', width: 10 },
+    { header: '案件ID', key: 'id', width: 10 },
+    { header: '地址', key: 'address', width: 30 },
+    { header: '坐标', key: 'coordinates', width: 20 },
+    { header: '描述', key: 'description', width: 30 },
+    { header: '状态', key: 'status', width: 12 },
+  ];
+  for (const report of reports) {
+    const cases = report.details?.illegalDischarge?.cases || [];
+    for (const c of cases) {
+      caseListSheet.addRow({
+        reportDate: new Date(report.reportDate).toISOString().split('T')[0],
+        district: report.district,
+        ...c,
+      });
+    }
   }
 
   await workbook.xlsx.writeFile(filePath);

@@ -259,9 +259,21 @@ async function updateInspectionOrder(orderId, updateData) {
   const order = await db.InspectionOrder.findByPk(orderId);
   if (!order) return null;
 
-  const updateFields = { ...updateData };
+  const updateFields = {};
+  if (updateData.status) updateFields.status = updateData.status;
+  if (updateData.fieldCondition) updateFields.fieldCondition = updateData.fieldCondition;
+  if (updateData.handlingResult) updateFields.handlingResult = updateData.handlingResult;
+  if (updateData.handlingPhotos) updateFields.handlingPhotos = updateData.handlingPhotos;
+
   if (updateData.status === 'completed') {
     updateFields.completedAt = new Date();
+    if (updateData.fieldCondition) updateFields.fieldCondition = updateData.fieldCondition;
+    if (updateData.handlingResult) updateFields.handlingResult = updateData.handlingResult;
+    if (updateData.handlingPhotos) updateFields.handlingPhotos = updateData.handlingPhotos;
+  }
+
+  if (updateData.status === 'in_progress') {
+    updateFields.status = 'in_progress';
   }
 
   await order.update(updateFields);
