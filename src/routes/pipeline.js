@@ -56,4 +56,14 @@ router.post('/pipeline/check-overdue', async (req, res) => {
   }
 });
 
+router.get('/pipeline-nodes/:id/warning-stats', async (req, res) => {
+  try {
+    const result = await warningService.getNodeWarningStats(req.params.id);
+    if (!result) return res.status(404).json({ code: -1, message: '节点不存在', data: null });
+    res.json({ code: 0, message: 'success', data: result });
+  } catch (error) {
+    res.status(500).json({ code: -1, message: error.message, data: null });
+  }
+});
+
 module.exports = router;

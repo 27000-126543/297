@@ -3,30 +3,73 @@ const path = require('path');
 const fs = require('fs');
 const ExcelJS = require('exceljs');
 
-function matchDischargeDistrict(discharge, district) {
-  const address = discharge.address || '';
-  if (address.includes(district)) return true;
+function resolveDistrictForDischarge(discharge) {
+  const addressDistrict = extractDistrictFromAddress(discharge.address || '');
+  const coordDistrict = extractDistrictFromCoords(discharge);
+  const reporterDistrict = discharge.reporter?.district || null;
 
-  const location = discharge.location;
-  if (location && location.lat && location.lng) {
-    return isLocationInDistrict(location.lat, location.lng, district);
+  if (addressDistrict && coordDistrict && addressDistrict !== coordDistrict) {
+    return {
+      district: coordDistrict,
+      attributionBasis: 'coordinate',
+      attributionConflict: true,
+      addressDistrict,
+      coordDistrict,
+      reporterDistrict,
+    };
   }
 
-  if (discharge.reporter && discharge.reporter.district === district) return true;
+  if (addressDistrict) {
+    return { district: addressDistrict, attributionBasis: 'address', attributionConflict: false, reporterDistrict };
+  }
+  if (coordDistrict) {
+    return { district: coordDistrict, attributionBasis: 'coordinate', attributionConflict: false, reporterDistrict };
+  }
+  if (reporterDistrict) {
+    return { district: reporterDistrict, attributionBasis: 'reporter', attributionConflict: false, reporterDistrict };
+  }
 
-  return false;
+  return { district: null, attributionBasis: 'unknown', attributionConflict: false, reporterDistrict };
 }
 
-function isLocationInDistrict(lat, lng, district) {
+function extractDistrictFromAddress(address) {
+  const DISTRICTS = ['东区', '西区', '南区', '北区'];
+  for (const d of DISTRICTS) {
+    if (address.includes(d)) return d;
+  }
+  return null;
+}
+
+function extractDistrictFromCoords(discharge) {
+  let lat = null;
+  let lng = null;
+  if (discharge.location && discharge.location.lat && discharge.location.lng) {
+    lat = discharge.location.lat;
+    lng = discharge.location.lng;
+  } else if (discharge.coordinates) {
+    const parts = String(discharge.coordinates).split(',');
+    if (parts.length >= 2) {
+      lat = parseFloat(parts[0]);
+      lng = parseFloat(parts[1]);
+    }
+  }
+  if (lat == null || lng == null || isNaN(lat) || isNaN(lng)) return null;
+  return getDistrictByCoords(lat, lng);
+}
+
+function getDistrictByCoords(lat, lng) {
   const DISTRICT_BOUNDS = {
     '东区': { minLat: 30.5, maxLat: 30.7, minLng: 104.0, maxLng: 104.2 },
     '西区': { minLat: 30.5, maxLat: 30.7, minLng: 103.8, maxLng: 104.0 },
     '南区': { minLat: 30.3, maxLat: 30.5, minLng: 103.9, maxLng: 104.1 },
     '北区': { minLat: 30.7, maxLat: 30.9, minLng: 103.9, maxLng: 104.1 },
   };
-  const bounds = DISTRICT_BOUNDS[district];
-  if (!bounds) return false;
-  return lat >= bounds.minLat && lat <= bounds.maxLat && lng >= bounds.minLng && lng <= bounds.maxLng;
+  for (const [district, bounds] of Object.entries(DISTRICT_BOUNDS)) {
+    if (lat >= bounds.minLat && lat <= bounds.maxLat && lng >= bounds.minLng && lng <= bounds.maxLng) {
+      return district;
+    }
+  }
+  return null;
 }
 
 async function generateDailyReport(reportDate, district) {
@@ -108,19 +151,28 @@ async function generateDailyReport(reportDate, district) {
   });
 
   const illegalDischargeCases = allDischarges.filter((d) => {
-    return matchDischargeDistrict(d, district);
+    const resolved = resolveDistrictForDischarge(d);
+    return resolved.district === district;
   }).length;
 
   const illegalDischargeDetails = allDischarges.filter((d) => {
-    return matchDischargeDistrict(d, district);
-  }).map((d) => ({
-    id: d.id,
-    address: d.address,
-    coordinates: d.coordinates,
-    description: d.description,
-    status: d.status,
-    reporterDistrict: d.reporter?.district,
-  }));
+    const resolved = resolveDistrictForDischarge(d);
+    return resolved.district === district;
+  }).map((d) => {
+    const resolved = resolveDistrictForDischarge(d);
+    return {
+      id: d.id,
+      address: d.address,
+      coordinates: d.coordinates,
+      description: d.description,
+      status: d.status,
+      attributionBasis: resolved.attributionBasis,
+      attributionConflict: resolved.attributionConflict,
+      addressDistrict: resolved.addressDistrict,
+      coordDistrict: resolved.coordDistrict,
+      reporterDistrict: resolved.reporterDistrict,
+    };
+  });
 
   const details = {
     pumpEnergy: {
@@ -280,6 +332,11 @@ async function exportReportToExcel(reportId) {
       { header: '坐标', key: 'coordinates', width: 20 },
       { header: '描述', key: 'description', width: 30 },
       { header: '状态', key: 'status', width: 12 },
+      { header: '归属依据', key: 'attributionBasis', width: 12 },
+      { header: '归属冲突', key: 'attributionConflict', width: 12 },
+      { header: '地址片区', key: 'addressDistrict', width: 10 },
+      { header: '坐标片区', key: 'coordDistrict', width: 10 },
+      { header: '上报人片区', key: 'reporterDistrict', width: 12 },
     ];
     for (const c of illegalDetails.cases) {
       caseListSheet.addRow(c);
@@ -412,6 +469,11 @@ async function exportReportsBatch(options = {}) {
     { header: '坐标', key: 'coordinates', width: 20 },
     { header: '描述', key: 'description', width: 30 },
     { header: '状态', key: 'status', width: 12 },
+    { header: '归属依据', key: 'attributionBasis', width: 12 },
+    { header: '归属冲突', key: 'attributionConflict', width: 12 },
+    { header: '地址片区', key: 'addressDistrict', width: 10 },
+    { header: '坐标片区', key: 'coordDistrict', width: 10 },
+    { header: '上报人片区', key: 'reporterDistrict', width: 12 },
   ];
   for (const report of reports) {
     const cases = report.details?.illegalDischarge?.cases || [];

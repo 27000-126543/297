@@ -69,6 +69,7 @@ async function checkNodeAnomaly(nodeId) {
       threshold,
       actualValue: check.value,
       status: 'active',
+      historySummary: await buildHistorySummary(node.id, check.type),
     });
     newWarnings.push(warning);
     await assignInspectionOrder(warning);
@@ -288,6 +289,131 @@ async function updateInspectionOrder(orderId, updateData) {
   return order;
 }
 
+async function buildHistorySummary(nodeId, type) {
+  const recentWarnings = await db.Warning.findAll({
+    where: { nodeId, type, status: 'resolved' },
+    order: [['createdAt', 'DESC']],
+    limit: 5,
+  });
+
+  if (recentWarnings.length === 0) return null;
+
+  const warningIds = recentWarnings.map((w) => w.id);
+  const completedOrders = await db.InspectionOrder.findAll({
+    where: {
+      warningId: { [Op.in]: warningIds },
+      status: 'completed',
+    },
+  });
+
+  const summaries = completedOrders.map((order) => ({
+    warningId: order.warningId,
+    completedAt: order.completedAt,
+    fieldCondition: order.fieldCondition,
+    handlingResult: order.handlingResult,
+    handlingPhotos: order.handlingPhotos,
+  }));
+
+  const handlingResults = completedOrders
+    .map((o) => o.handlingResult)
+    .filter(Boolean);
+
+  const resultCounts = {};
+  for (const r of handlingResults) {
+    resultCounts[r] = (resultCounts[r] || 0) + 1;
+  }
+
+  return {
+    previousWarningCount: recentWarnings.length,
+    previousCompletedOrders: completedOrders.length,
+    recentHandlingResults: summaries,
+    commonResults: Object.entries(resultCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([result, count]) => ({ result, count })),
+    lastOccurredAt: recentWarnings[0]?.createdAt,
+    lastResolvedAt: recentWarnings[0]?.resolvedAt,
+  };
+}
+
+async function getNodeWarningStats(nodeId) {
+  const node = await db.PipelineNode.findByPk(nodeId);
+  if (!node) return null;
+
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  const warnings = await db.Warning.findAll({
+    where: {
+      nodeId,
+      createdAt: { [Op.gte]: thirtyDaysAgo },
+    },
+    order: [['createdAt', 'DESC']],
+  });
+
+  const warningIds = warnings.map((w) => w.id);
+  const orders = await db.InspectionOrder.findAll({
+    where: { warningId: { [Op.in]: warningIds } },
+    order: [['createdAt', 'DESC']],
+  });
+
+  const completedOrders = orders.filter((o) => o.status === 'completed' && o.completedAt);
+  const totalResponseTime = completedOrders.reduce((sum, order) => {
+    const warning = warnings.find((w) => w.id === order.warningId);
+    if (warning && order.completedAt) {
+      return sum + (new Date(order.completedAt) - new Date(warning.createdAt));
+    }
+    return sum;
+  }, 0);
+  const avgResponseTimeMs = completedOrders.length > 0 ? totalResponseTime / completedOrders.length : 0;
+
+  const handlingResults = completedOrders.map((o) => o.handlingResult).filter(Boolean);
+  const resultCounts = {};
+  for (const r of handlingResults) {
+    resultCounts[r] = (resultCounts[r] || 0) + 1;
+  }
+
+  const allPhotos = completedOrders.flatMap((o) => o.handlingPhotos || []);
+
+  return {
+    nodeId,
+    nodeName: node.name,
+    district: node.district,
+    period: '30days',
+    totalWarnings: warnings.length,
+    activeWarnings: warnings.filter((w) => w.status === 'active').length,
+    resolvedWarnings: warnings.filter((w) => w.status === 'resolved').length,
+    levelDistribution: {
+      RED: warnings.filter((w) => w.level === 'RED').length,
+      ORANGE: warnings.filter((w) => w.level === 'ORANGE').length,
+      YELLOW: warnings.filter((w) => w.level === 'YELLOW').length,
+    },
+    typeDistribution: {
+      level_anomaly: warnings.filter((w) => w.type === 'level_anomaly').length,
+      flow_rate_anomaly: warnings.filter((w) => w.type === 'flow_rate_anomaly').length,
+    },
+    inspectionStats: {
+      totalOrders: orders.length,
+      completedOrders: completedOrders.length,
+      pendingOrders: orders.filter((o) => o.status === 'assigned' || o.status === 'in_progress').length,
+      avgResponseTimeMinutes: avgResponseTimeMs / (1000 * 60),
+    },
+    commonHandlingResults: Object.entries(resultCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([result, count]) => ({ result, count })),
+    recentPhotos: allPhotos.slice(0, 10),
+    recentCompletedOrders: completedOrders.slice(0, 5).map((o) => ({
+      id: o.id,
+      warningId: o.warningId,
+      completedAt: o.completedAt,
+      fieldCondition: o.fieldCondition,
+      handlingResult: o.handlingResult,
+      handlingPhotos: o.handlingPhotos,
+    })),
+  };
+}
+
 module.exports = {
   checkPipelineAnomalies,
   checkNodeAnomaly,
@@ -297,4 +423,5 @@ module.exports = {
   listWarnings,
   listInspectionOrders,
   updateInspectionOrder,
+  getNodeWarningStats,
 };

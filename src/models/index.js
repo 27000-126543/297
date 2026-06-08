@@ -85,9 +85,11 @@ const LoadDistribution = sequelize.define('LoadDistribution', {
   transferredLoad: { type: DataTypes.FLOAT },
   reason: { type: DataTypes.STRING },
   status: { type: DataTypes.STRING },
+  distributionGroupId: { type: DataTypes.STRING },
   confirmedAt: { type: DataTypes.DATE },
   rejectReason: { type: DataTypes.STRING },
   finalTransferredLoad: { type: DataTypes.FLOAT },
+  parentDistributionId: { type: DataTypes.INTEGER },
   createdAt: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
 });
 
@@ -126,6 +128,7 @@ const Warning = sequelize.define('Warning', {
   actualValue: { type: DataTypes.FLOAT },
   status: { type: DataTypes.STRING },
   resolvedAt: { type: DataTypes.DATE },
+  historySummary: { type: DataTypes.JSON },
   createdAt: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
 });
 
@@ -236,6 +239,7 @@ const ScheduleInstruction = sequelize.define('ScheduleInstruction', {
   parameters: { type: DataTypes.JSON },
   reason: { type: DataTypes.STRING },
   status: { type: DataTypes.STRING },
+  distributionGroupId: { type: DataTypes.STRING },
   confirmedAt: { type: DataTypes.DATE },
   rejectReason: { type: DataTypes.STRING },
   executedAt: { type: DataTypes.DATE },

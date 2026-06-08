@@ -1,5 +1,6 @@
 const db = require('../models');
 const { pushNotification } = require('./notificationPush');
+const { v4: uuidv4 } = require('uuid');
 
 const POLLUTANT_FIELDS = ['cod', 'ammoniaNitrogen', 'totalPhosphorus', 'suspendedSolids', 'ph'];
 
@@ -124,6 +125,8 @@ async function redistributeLoad(plantId, reason, incomingWaterVolume = 0) {
 
   const actualTransfer = Math.min(overloadAmount, totalAvailable);
 
+  const groupId = uuidv4();
+
   for (const plant of availablePlants) {
     const available = plant.designCapacity * 0.85 - plant.currentLoad;
     const share = (available / totalAvailable) * actualTransfer;
@@ -134,23 +137,26 @@ async function redistributeLoad(plantId, reason, incomingWaterVolume = 0) {
       transferredLoad: share,
       reason,
       status: 'pending',
+      distributionGroupId: groupId,
     });
 
     await db.ScheduleInstruction.create({
       plantId: plant.id,
       instructionType: 'load_transfer',
-      parameters: { transferredLoad: share, fromPlantId: plantId, fromPlantName: overloadedPlant.name, toPlantName: plant.name },
+      parameters: { transferredLoad: share, fromPlantId: plantId, fromPlantName: overloadedPlant.name, toPlantName: plant.name, distributionGroupId: groupId },
       reason,
       status: 'pending',
+      distributionGroupId: groupId,
     });
 
     await db.ScheduleInstruction.create({
       pumpStationId: null,
       plantId: overloadedPlant.id,
       instructionType: 'load_transfer',
-      parameters: { transferredLoad: share, toPlantId: plant.id, toPlantName: plant.name },
+      parameters: { transferredLoad: share, toPlantId: plant.id, toPlantName: plant.name, distributionGroupId: groupId },
       reason,
       status: 'pending',
+      distributionGroupId: groupId,
     });
 
     await plant.update({ currentLoad: plant.currentLoad + share });
@@ -228,6 +234,11 @@ async function getLoadDistributionHistory(plantId, options = {}) {
     item.fromPlantName = item.fromPlant?.name || null;
     item.toPlantName = item.plant?.name || null;
     item.direction = r.fromPlantId === Number(plantId) ? 'outgoing' : 'incoming';
+    item.distributionGroupId = r.distributionGroupId;
+    item.parentDistributionId = r.parentDistributionId;
+    item.finalTransferredLoad = r.finalTransferredLoad;
+    item.confirmedAt = r.confirmedAt;
+    item.rejectReason = r.rejectReason;
     return item;
   });
 
@@ -244,15 +255,19 @@ async function confirmInstruction(instructionId) {
     confirmedAt: new Date(),
   });
 
-  if (instruction.instructionType === 'load_transfer' && instruction.plantId) {
-    const distributions = await db.LoadDistribution.findAll({
-      where: { plantId: instruction.plantId, status: 'pending' },
+  if (instruction.instructionType === 'load_transfer' && instruction.plantId && instruction.distributionGroupId) {
+    const distribution = await db.LoadDistribution.findOne({
+      where: {
+        plantId: instruction.plantId,
+        distributionGroupId: instruction.distributionGroupId,
+        status: 'pending',
+      },
     });
-    for (const dist of distributions) {
-      await dist.update({
+    if (distribution) {
+      await distribution.update({
         status: 'confirmed',
         confirmedAt: new Date(),
-        finalTransferredLoad: dist.transferredLoad,
+        finalTransferredLoad: distribution.transferredLoad,
       });
     }
   }
@@ -261,6 +276,7 @@ async function confirmInstruction(instructionId) {
     instructionId,
     plantId: instruction.plantId,
     instructionType: instruction.instructionType,
+    distributionGroupId: instruction.distributionGroupId,
   });
 
   return instruction;
@@ -279,15 +295,28 @@ async function rejectInstruction(instructionId, rejectReason) {
   const rejectedPlantId = instruction.plantId;
   const rejectedLoad = instruction.parameters?.transferredLoad || 0;
   const fromPlantId = instruction.parameters?.fromPlantId;
+  const groupId = instruction.distributionGroupId;
 
-  const relatedDistributions = await db.LoadDistribution.findAll({
-    where: { plantId: rejectedPlantId, fromPlantId, status: 'pending' },
-  });
-  for (const dist of relatedDistributions) {
-    await dist.update({
-      status: 'rejected',
-      rejectReason: rejectReason || '未说明原因',
+  if (groupId) {
+    const distribution = await db.LoadDistribution.findOne({
+      where: { plantId: rejectedPlantId, distributionGroupId: groupId, status: 'pending' },
     });
+    if (distribution) {
+      await distribution.update({
+        status: 'rejected',
+        rejectReason: rejectReason || '未说明原因',
+      });
+    }
+  } else {
+    const relatedDistributions = await db.LoadDistribution.findAll({
+      where: { plantId: rejectedPlantId, fromPlantId, status: 'pending' },
+    });
+    for (const dist of relatedDistributions) {
+      await dist.update({
+        status: 'rejected',
+        rejectReason: rejectReason || '未说明原因',
+      });
+    }
   }
 
   const rejectedPlant = await db.TreatmentPlant.findByPk(rejectedPlantId);
@@ -297,7 +326,7 @@ async function rejectInstruction(instructionId, rejectReason) {
   }
 
   if (fromPlantId) {
-    await retryLoadRedistribution(fromPlantId, rejectedLoad, rejectedPlantId, rejectReason);
+    await retryLoadRedistribution(fromPlantId, rejectedLoad, rejectedPlantId, rejectReason, groupId);
   }
 
   pushNotification('supervisor', 'instruction_rejected', {
@@ -305,12 +334,13 @@ async function rejectInstruction(instructionId, rejectReason) {
     plantId: rejectedPlantId,
     rejectReason,
     retryAttempted: !!fromPlantId,
+    distributionGroupId: groupId,
   });
 
   return instruction;
 }
 
-async function retryLoadRedistribution(fromPlantId, rejectedLoad, excludePlantId, originalReason) {
+async function retryLoadRedistribution(fromPlantId, rejectedLoad, excludePlantId, originalReason, parentGroupId) {
   const overloadedPlant = await db.TreatmentPlant.findByPk(fromPlantId);
   if (!overloadedPlant) return;
 
@@ -341,6 +371,11 @@ async function retryLoadRedistribution(fromPlantId, rejectedLoad, excludePlantId
   if (totalAvailable <= 0) return;
 
   const actualTransfer = Math.min(rejectedLoad, totalAvailable);
+  const retryGroupId = uuidv4();
+
+  const parentDistribution = parentGroupId ? await db.LoadDistribution.findOne({
+    where: { distributionGroupId: parentGroupId },
+  }) : null;
 
   for (const plant of availablePlants) {
     const available = plant.designCapacity * 0.85 - plant.currentLoad;
@@ -352,14 +387,17 @@ async function retryLoadRedistribution(fromPlantId, rejectedLoad, excludePlantId
       transferredLoad: share,
       reason: `retry_after_rejection: ${originalReason || '原接受方拒绝'}`,
       status: 'pending',
+      distributionGroupId: retryGroupId,
+      parentDistributionId: parentDistribution ? parentDistribution.id : null,
     });
 
     await db.ScheduleInstruction.create({
       plantId: plant.id,
       instructionType: 'load_transfer',
-      parameters: { transferredLoad: share, fromPlantId, fromPlantName: overloadedPlant.name, toPlantName: plant.name, isRetry: true },
+      parameters: { transferredLoad: share, fromPlantId, fromPlantName: overloadedPlant.name, toPlantName: plant.name, isRetry: true, parentGroupId, distributionGroupId: retryGroupId },
       reason: `retry_after_rejection: ${originalReason || '原接受方拒绝'}`,
       status: 'pending',
+      distributionGroupId: retryGroupId,
     });
 
     await plant.update({ currentLoad: plant.currentLoad + share });
@@ -371,6 +409,8 @@ async function retryLoadRedistribution(fromPlantId, rejectedLoad, excludePlantId
     transferredLoad: actualTransfer,
     toPlants: availablePlants.map((p) => ({ id: p.id, name: p.name })),
     reason: originalReason,
+    retryGroupId,
+    parentGroupId,
   });
 }
 
@@ -383,4 +423,92 @@ module.exports = {
   getLoadDistributionHistory,
   confirmInstruction,
   rejectInstruction,
+  getDispatchDashboard,
 };
+
+async function getDispatchDashboard(options = {}) {
+  const { plantId, district } = options;
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+
+  const plantWhere = {};
+  if (plantId) plantWhere.id = plantId;
+  if (district) plantWhere.district = district;
+
+  const plants = await db.TreatmentPlant.findAll({ where: plantWhere });
+
+  const instructions = await db.ScheduleInstruction.findAll({
+    where: {
+      instructionType: 'load_transfer',
+      createdAt: { [db.Sequelize.Op.gte]: todayStart },
+    },
+    include: [
+      { model: db.TreatmentPlant, as: 'plant', attributes: ['id', 'name', 'district'] },
+    ],
+    order: [['createdAt', 'DESC']],
+  });
+
+  const distributions = await db.LoadDistribution.findAll({
+    where: {
+      createdAt: { [db.Sequelize.Op.gte]: todayStart },
+    },
+    include: [
+      { model: db.TreatmentPlant, as: 'plant', attributes: ['id', 'name', 'district'] },
+      { model: db.TreatmentPlant, as: 'fromPlant', attributes: ['id', 'name', 'district'] },
+    ],
+    order: [['createdAt', 'DESC']],
+  });
+
+  const plantSummaries = plants.map((plant) => {
+    const plantInstructions = instructions.filter(
+      (i) => i.plantId === plant.id && i.parameters?.fromPlantId
+    );
+    const plantDistributions = distributions.filter((d) => d.plantId === plant.id);
+
+    const pendingLoad = plantDistributions
+      .filter((d) => d.status === 'pending')
+      .reduce((sum, d) => sum + (d.transferredLoad || 0), 0);
+    const confirmedLoad = plantDistributions
+      .filter((d) => d.status === 'confirmed')
+      .reduce((sum, d) => sum + (d.finalTransferredLoad || d.transferredLoad || 0), 0);
+    const rejectedLoad = plantDistributions
+      .filter((d) => d.status === 'rejected')
+      .reduce((sum, d) => sum + (d.transferredLoad || 0), 0);
+
+    return {
+      id: plant.id,
+      name: plant.name,
+      district: plant.district,
+      designCapacity: plant.designCapacity,
+      currentLoad: plant.currentLoad,
+      pendingTransferLoad: pendingLoad,
+      confirmedTransferLoad: confirmedLoad,
+      rejectedTransferLoad: rejectedLoad,
+      availableCapacity: plant.designCapacity * 0.85 - plant.currentLoad,
+      totalCapacity85: plant.designCapacity * 0.85,
+      pendingInstructions: plantInstructions.filter((i) => i.status === 'pending').length,
+      confirmedInstructions: plantInstructions.filter((i) => i.status === 'confirmed').length,
+      rejectedInstructions: plantInstructions.filter((i) => i.status === 'rejected').length,
+    };
+  });
+
+  const statusSummary = {
+    pending: instructions.filter((i) => i.status === 'pending').length,
+    confirmed: instructions.filter((i) => i.status === 'confirmed').length,
+    rejected: instructions.filter((i) => i.status === 'rejected').length,
+  };
+
+  const transferChain = distributions.map((d) => {
+    const item = d.toJSON();
+    item.fromPlantName = item.fromPlant?.name || null;
+    item.toPlantName = item.plant?.name || null;
+    return item;
+  });
+
+  return {
+    statusSummary,
+    plantSummaries,
+    transferChain,
+    totalInstructions: instructions.length,
+  };
+}
