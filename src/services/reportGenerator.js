@@ -76,6 +76,13 @@ async function generateDailyReport(reportDate, district) {
     where: {
       createdAt: { [db.Sequelize.Op.gte]: dayStart, [db.Sequelize.Op.lte]: dayEnd },
     },
+    include: [{
+      model: db.User,
+      as: 'reporter',
+      where: { district },
+      required: true,
+      attributes: [],
+    }],
   });
 
   const details = {

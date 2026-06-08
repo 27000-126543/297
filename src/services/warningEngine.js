@@ -14,59 +14,87 @@ function calculateDistance(lat1, lng1, lat2, lng2) {
   return R * c;
 }
 
-async function checkPipelineAnomalies() {
-  const nodes = await db.PipelineNode.findAll();
-  const warnings = [];
+async function checkNodeAnomaly(nodeId) {
+  const node = await db.PipelineNode.findByPk(nodeId);
+  if (!node) return [];
 
-  for (const node of nodes) {
-    let levelWarning = null;
-    let flowWarning = null;
+  const newWarnings = [];
+  const checks = [
+    { value: node.currentLevel, normal: node.normalLevel, type: 'level_anomaly', label: '液位' },
+    { value: node.currentFlowRate, normal: node.normalFlowRate, type: 'flow_rate_anomaly', label: '流量' },
+  ];
 
-    if (node.normalLevel && node.currentLevel) {
-      const ratio = node.currentLevel / node.normalLevel;
-      if (ratio > 1.5) {
-        levelWarning = { level: 'RED', type: 'level_anomaly', threshold: node.normalLevel * 1.5, actualValue: node.currentLevel };
-      } else if (ratio > 1.3) {
-        levelWarning = { level: 'ORANGE', type: 'level_anomaly', threshold: node.normalLevel * 1.3, actualValue: node.currentLevel };
-      } else if (ratio > 1.15) {
-        levelWarning = { level: 'YELLOW', type: 'level_anomaly', threshold: node.normalLevel * 1.15, actualValue: node.currentLevel };
-      }
+  for (const check of checks) {
+    if (!check.normal || !check.value) continue;
+
+    const ratio = check.value / check.normal;
+    let warningLevel = null;
+    let threshold = null;
+
+    if (ratio > 1.5) {
+      warningLevel = 'RED';
+      threshold = check.normal * 1.5;
+    } else if (ratio > 1.3) {
+      warningLevel = 'ORANGE';
+      threshold = check.normal * 1.3;
+    } else if (ratio > 1.15) {
+      warningLevel = 'YELLOW';
+      threshold = check.normal * 1.15;
     }
 
-    if (node.normalFlowRate && node.currentFlowRate) {
-      const ratio = node.currentFlowRate / node.normalFlowRate;
-      if (ratio > 1.5) {
-        flowWarning = { level: 'RED', type: 'flow_rate_anomaly', threshold: node.normalFlowRate * 1.5, actualValue: node.currentFlowRate };
-      } else if (ratio > 1.3) {
-        flowWarning = { level: 'ORANGE', type: 'flow_rate_anomaly', threshold: node.normalFlowRate * 1.3, actualValue: node.currentFlowRate };
-      } else if (ratio > 1.15) {
-        flowWarning = { level: 'YELLOW', type: 'flow_rate_anomaly', threshold: node.normalFlowRate * 1.15, actualValue: node.currentFlowRate };
-      }
-    }
+    if (!warningLevel) continue;
 
-    const anomalyWarnings = [levelWarning, flowWarning].filter(Boolean);
-
-    for (const w of anomalyWarnings) {
-      const warning = await db.Warning.create({
+    const existingActive = await db.Warning.findOne({
+      where: {
         nodeId: node.id,
-        level: w.level,
-        type: w.type,
-        description: `${node.name} ${w.type === 'level_anomaly' ? '液位' : '流量'}异常，当前值 ${w.actualValue} 超过阈值 ${w.threshold}`,
-        threshold: w.threshold,
-        actualValue: w.actualValue,
+        type: check.type,
         status: 'active',
-      });
-      warnings.push(warning);
-      await assignInspectionOrder(warning);
+      },
+      order: [['createdAt', 'DESC']],
+    });
 
-      if (w.level === 'ORANGE' || w.level === 'RED') {
-        pushNotification('operator', 'pipeline_anomaly', { warning, node });
-        pushNotification('supervisor', 'pipeline_anomaly', { warning, node });
+    if (existingActive) {
+      const existingRatio = existingActive.actualValue / existingActive.threshold;
+      if (warningLevel === existingActive.level || isLowerLevel(warningLevel, existingActive.level)) {
+        continue;
       }
+      await existingActive.update({ status: 'resolved', resolvedAt: new Date() });
+    }
+
+    const warning = await db.Warning.create({
+      nodeId: node.id,
+      level: warningLevel,
+      type: check.type,
+      description: `${node.name} ${check.label}异常，当前值 ${check.value} 超过阈值 ${threshold}`,
+      threshold,
+      actualValue: check.value,
+      status: 'active',
+    });
+    newWarnings.push(warning);
+    await assignInspectionOrder(warning);
+
+    if (warningLevel === 'ORANGE' || warningLevel === 'RED') {
+      pushNotification('operator', 'pipeline_anomaly', { warning, node });
+      pushNotification('supervisor', 'pipeline_anomaly', { warning, node });
     }
   }
 
-  return warnings;
+  return newWarnings;
+}
+
+function isLowerLevel(newLevel, existingLevel) {
+  const order = { 'YELLOW': 1, 'ORANGE': 2, 'RED': 3 };
+  return (order[newLevel] || 0) <= (order[existingLevel] || 0);
+}
+
+async function checkPipelineAnomalies() {
+  const nodes = await db.PipelineNode.findAll();
+  const allWarnings = [];
+  for (const node of nodes) {
+    const nodeWarnings = await checkNodeAnomaly(node.id);
+    allWarnings.push(...nodeWarnings);
+  }
+  return allWarnings;
 }
 
 async function assignInspectionOrder(warning, options = {}) {
@@ -177,7 +205,9 @@ async function reportNodeData(nodeId, data) {
     { where: { id: nodeId } }
   );
 
-  return record;
+  const newWarnings = await checkNodeAnomaly(nodeId);
+
+  return { record, warnings: newWarnings };
 }
 
 async function listWarnings(options = {}) {
@@ -248,6 +278,7 @@ async function updateInspectionOrder(orderId, updateData) {
 
 module.exports = {
   checkPipelineAnomalies,
+  checkNodeAnomaly,
   assignInspectionOrder,
   checkOverdueOrders,
   reportNodeData,

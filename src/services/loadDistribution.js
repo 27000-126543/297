@@ -28,9 +28,23 @@ async function reportInfluentData(plantId, data) {
   const plant = await db.TreatmentPlant.findByPk(plantId);
   if (!plant) return record;
 
-  const exceeded = checkExceedance(data, plant.effluentStandard);
-  if (exceeded) {
-    await redistributeLoad(plantId, 'influent_exceedance');
+  const pollutantExceeded = checkExceedance(data, plant.effluentStandard);
+
+  const projectedLoad = plant.currentLoad + (data.waterVolume || 0);
+  const capacityOverloaded = projectedLoad > plant.designCapacity;
+
+  const highRiskPollutant = pollutantExceeded && projectedLoad > plant.designCapacity * 0.7;
+
+  if (capacityOverloaded || highRiskPollutant || pollutantExceeded) {
+    let reason;
+    if (capacityOverloaded) {
+      reason = `capacity_overload:当前负荷${plant.currentLoad}+进水量${data.waterVolume || 0}=${projectedLoad}超过设计能力${plant.designCapacity}`;
+    } else if (highRiskPollutant) {
+      reason = 'high_risk_pollutant:进水超标且负荷超过70%设计能力';
+    } else {
+      reason = 'influent_exceedance:进水水质超标';
+    }
+    await redistributeLoad(plantId, reason, data.waterVolume || 0);
   }
 
   return record;
@@ -55,7 +69,7 @@ async function reportEffluentData(plantId, data) {
   });
 
   if (!isCompliant) {
-    await redistributeLoad(plantId, 'effluent_non_compliant');
+    await redistributeLoad(plantId, 'effluent_non_compliant', 0);
     pushNotification('supervisor', 'effluent_non_compliant', {
       plantId,
       plantName: plant.name,
@@ -71,23 +85,34 @@ async function reportEffluentData(plantId, data) {
   return record;
 }
 
-async function redistributeLoad(plantId, reason) {
+async function redistributeLoad(plantId, reason, incomingWaterVolume = 0) {
   const overloadedPlant = await db.TreatmentPlant.findByPk(plantId);
   if (!overloadedPlant) return;
 
-  const overloadAmount = overloadedPlant.currentLoad - overloadedPlant.designCapacity * 0.85;
+  const overloadAmount = (overloadedPlant.currentLoad + incomingWaterVolume) - overloadedPlant.designCapacity * 0.85;
   if (overloadAmount <= 0) return;
 
-  const districtPlants = await db.TreatmentPlant.findAll({
+  let districtPlants = await db.TreatmentPlant.findAll({
     where: {
       district: overloadedPlant.district,
       id: { [db.Sequelize.Op.ne]: plantId },
     },
   });
 
-  const availablePlants = districtPlants.filter(
+  let availablePlants = districtPlants.filter(
     (p) => p.currentLoad < p.designCapacity * 0.85
   );
+
+  if (availablePlants.length === 0) {
+    districtPlants = await db.TreatmentPlant.findAll({
+      where: {
+        id: { [db.Sequelize.Op.ne]: plantId },
+      },
+    });
+    availablePlants = districtPlants.filter(
+      (p) => p.currentLoad < p.designCapacity * 0.85
+    );
+  }
 
   if (availablePlants.length === 0) return;
 
@@ -108,13 +133,22 @@ async function redistributeLoad(plantId, reason) {
       fromPlantId: plantId,
       transferredLoad: share,
       reason,
-      status: 'pending',
+      status: 'active',
     });
 
     await db.ScheduleInstruction.create({
       plantId: plant.id,
       instructionType: 'load_transfer',
-      parameters: { transferredLoad: share, fromPlantId: plantId },
+      parameters: { transferredLoad: share, fromPlantId: plantId, fromPlantName: overloadedPlant.name, toPlantName: plant.name },
+      reason,
+      status: 'pending',
+    });
+
+    await db.ScheduleInstruction.create({
+      pumpStationId: null,
+      plantId: overloadedPlant.id,
+      instructionType: 'load_transfer',
+      parameters: { transferredLoad: share, toPlantId: plant.id, toPlantName: plant.name },
       reason,
       status: 'pending',
     });
@@ -123,7 +157,7 @@ async function redistributeLoad(plantId, reason) {
   }
 
   await overloadedPlant.update({
-    currentLoad: overloadedPlant.currentLoad - actualTransfer,
+    currentLoad: Math.max(0, overloadedPlant.currentLoad - actualTransfer + incomingWaterVolume),
   });
 
   pushNotification('supervisor', 'load_redistribution', {
@@ -131,14 +165,16 @@ async function redistributeLoad(plantId, reason) {
     plantName: overloadedPlant.name,
     reason,
     transferredLoad: actualTransfer,
-    targetPlants: availablePlants.map((p) => ({ id: p.id, name: p.name })),
+    fromPlant: { id: overloadedPlant.id, name: overloadedPlant.name },
+    toPlants: availablePlants.map((p) => ({ id: p.id, name: p.name, transferredLoad: (p.designCapacity * 0.85 - p.currentLoad) / totalAvailable * actualTransfer })),
   });
   pushNotification('operator', 'load_redistribution', {
     plantId,
     plantName: overloadedPlant.name,
     reason,
     transferredLoad: actualTransfer,
-    targetPlants: availablePlants.map((p) => ({ id: p.id, name: p.name })),
+    fromPlant: { id: overloadedPlant.id, name: overloadedPlant.name },
+    toPlants: availablePlants.map((p) => ({ id: p.id, name: p.name, transferredLoad: (p.designCapacity * 0.85 - p.currentLoad) / totalAvailable * actualTransfer })),
   });
 }
 
@@ -178,11 +214,24 @@ async function getLoadDistributionHistory(plantId, options = {}) {
   const where = { [db.Sequelize.Op.and]: conditions };
   const { count, rows } = await db.LoadDistribution.findAndCountAll({
     where,
+    include: [
+      { model: db.TreatmentPlant, as: 'plant', attributes: ['id', 'name', 'district'] },
+      { model: db.TreatmentPlant, as: 'fromPlant', attributes: ['id', 'name', 'district'] },
+    ],
     order: [['createdAt', 'DESC']],
     limit: pageSize,
     offset: (page - 1) * pageSize,
   });
-  return { total: count, page, pageSize, data: rows };
+
+  const enriched = rows.map((r) => {
+    const item = r.toJSON();
+    item.fromPlantName = item.fromPlant?.name || null;
+    item.toPlantName = item.plant?.name || null;
+    item.direction = r.fromPlantId === Number(plantId) ? 'outgoing' : 'incoming';
+    return item;
+  });
+
+  return { total: count, page, pageSize, data: enriched };
 }
 
 module.exports = {
