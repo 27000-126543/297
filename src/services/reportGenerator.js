@@ -150,29 +150,48 @@ async function generateDailyReport(reportDate, district) {
     ],
   });
 
-  const illegalDischargeCases = allDischarges.filter((d) => {
+  const dischargeAttributions = allDischarges.map((d) => {
     const resolved = resolveDistrictForDischarge(d);
-    return resolved.district === district;
-  }).length;
-
-  const illegalDischargeDetails = allDischarges.filter((d) => {
-    const resolved = resolveDistrictForDischarge(d);
-    return resolved.district === district;
-  }).map((d) => {
-    const resolved = resolveDistrictForDischarge(d);
-    return {
-      id: d.id,
-      address: d.address,
-      coordinates: d.coordinates,
-      description: d.description,
-      status: d.status,
-      attributionBasis: resolved.attributionBasis,
-      attributionConflict: resolved.attributionConflict,
-      addressDistrict: resolved.addressDistrict,
-      coordDistrict: resolved.coordDistrict,
-      reporterDistrict: resolved.reporterDistrict,
-    };
+    return { discharge: d, resolved };
   });
+
+  const byAddress = dischargeAttributions.filter((a) => a.resolved.addressDistrict === district).length;
+  const byCoordinate = dischargeAttributions.filter((a) => a.resolved.coordDistrict === district).length;
+  const byReporter = dischargeAttributions.filter((a) => a.resolved.reporterDistrict === district).length;
+  const byFinal = dischargeAttributions.filter((a) => a.resolved.district === district).length;
+
+  const conflictCases = dischargeAttributions
+    .filter((a) => a.resolved.attributionConflict)
+    .map((a) => ({
+      id: a.discharge.id,
+      address: a.discharge.address,
+      coordinates: a.discharge.coordinates,
+      description: a.discharge.description,
+      status: a.discharge.status,
+      addressDistrict: a.resolved.addressDistrict,
+      coordDistrict: a.resolved.coordDistrict,
+      reporterDistrict: a.resolved.reporterDistrict,
+      finalDistrict: a.resolved.district,
+      attributionBasis: a.resolved.attributionBasis,
+      conflictNote: `地址归属${a.resolved.addressDistrict}，坐标归属${a.resolved.coordDistrict}，最终按${a.resolved.attributionBasis === 'coordinate' ? '坐标' : '地址'}归属${a.resolved.district}`,
+    }));
+
+  const illegalDischargeCases = byFinal;
+
+  const illegalDischargeDetails = dischargeAttributions
+    .filter((a) => a.resolved.district === district)
+    .map((a) => ({
+      id: a.discharge.id,
+      address: a.discharge.address,
+      coordinates: a.discharge.coordinates,
+      description: a.discharge.description,
+      status: a.discharge.status,
+      attributionBasis: a.resolved.attributionBasis,
+      attributionConflict: a.resolved.attributionConflict,
+      addressDistrict: a.resolved.addressDistrict,
+      coordDistrict: a.resolved.coordDistrict,
+      reporterDistrict: a.resolved.reporterDistrict,
+    }));
 
   const details = {
     pumpEnergy: {
@@ -200,6 +219,13 @@ async function generateDailyReport(reportDate, district) {
     illegalDischarge: {
       total: illegalDischargeCases,
       cases: illegalDischargeDetails,
+      attributionComparison: {
+        byAddress,
+        byCoordinate,
+        byReporter,
+        byFinal,
+      },
+      conflictCases,
     },
   };
 
@@ -323,6 +349,32 @@ async function exportReportToExcel(reportId) {
   ];
   const illegalDetails = report.details?.illegalDischarge || {};
   illegalSheet.addRow({ metric: '案件总数', value: illegalDetails.total || 0 });
+
+  const comp = illegalDetails.attributionComparison || {};
+  illegalSheet.addRow({ metric: '按地址归属', value: comp.byAddress || 0 });
+  illegalSheet.addRow({ metric: '按坐标归属', value: comp.byCoordinate || 0 });
+  illegalSheet.addRow({ metric: '按上报人归属', value: comp.byReporter || 0 });
+  illegalSheet.addRow({ metric: '最终归属(当前口径)', value: comp.byFinal || 0 });
+  illegalSheet.addRow({ metric: '冲突案件数', value: (illegalDetails.conflictCases || []).length });
+
+  if (illegalDetails.conflictCases && illegalDetails.conflictCases.length > 0) {
+    const conflictSheet = workbook.addWorksheet('归属冲突案件');
+    conflictSheet.columns = [
+      { header: '案件ID', key: 'id', width: 10 },
+      { header: '地址', key: 'address', width: 30 },
+      { header: '坐标', key: 'coordinates', width: 20 },
+      { header: '描述', key: 'description', width: 30 },
+      { header: '地址片区', key: 'addressDistrict', width: 10 },
+      { header: '坐标片区', key: 'coordDistrict', width: 10 },
+      { header: '上报人片区', key: 'reporterDistrict', width: 12 },
+      { header: '最终归属', key: 'finalDistrict', width: 10 },
+      { header: '归属依据', key: 'attributionBasis', width: 12 },
+      { header: '冲突说明', key: 'conflictNote', width: 40 },
+    ];
+    for (const c of illegalDetails.conflictCases) {
+      conflictSheet.addRow(c);
+    }
+  }
 
   if (illegalDetails.cases && illegalDetails.cases.length > 0) {
     const caseListSheet = workbook.addWorksheet('非法排污明细');

@@ -76,4 +76,13 @@ router.get('/dispatch-dashboard', async (req, res) => {
   }
 });
 
+router.get('/transfer-retrospective', async (req, res) => {
+  try {
+    const result = await loadService.getTransferRetrospective(req.query);
+    res.json({ code: 0, message: 'success', data: result });
+  } catch (error) {
+    res.status(500).json({ code: -1, message: error.message, data: null });
+  }
+});
+
 module.exports = router;

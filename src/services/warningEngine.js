@@ -290,10 +290,13 @@ async function updateInspectionOrder(orderId, updateData) {
 }
 
 async function buildHistorySummary(nodeId, type) {
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
   const recentWarnings = await db.Warning.findAll({
-    where: { nodeId, type, status: 'resolved' },
+    where: { nodeId, type, status: 'resolved', createdAt: { [Op.gte]: thirtyDaysAgo } },
     order: [['createdAt', 'DESC']],
-    limit: 5,
+    limit: 10,
   });
 
   if (recentWarnings.length === 0) return null;
@@ -323,7 +326,25 @@ async function buildHistorySummary(nodeId, type) {
     resultCounts[r] = (resultCounts[r] || 0) + 1;
   }
 
+  const recurrenceCount = recentWarnings.length;
+
+  let lastHandlingResult = null;
+  let lastFieldCondition = null;
+  if (completedOrders.length > 0) {
+    const latestOrder = completedOrders.sort((a, b) => new Date(b.completedAt) - new Date(a.completedAt))[0];
+    lastHandlingResult = latestOrder.handlingResult;
+    lastFieldCondition = latestOrder.fieldCondition;
+  }
+
+  const intervals = [];
+  for (let i = 0; i < recentWarnings.length - 1; i++) {
+    const diff = new Date(recentWarnings[i].createdAt) - new Date(recentWarnings[i + 1].createdAt);
+    intervals.push(diff / (1000 * 60));
+  }
+  const avgRepeatIntervalMinutes = intervals.length > 0 ? intervals.reduce((a, b) => a + b, 0) / intervals.length : null;
+
   return {
+    recurrenceCount,
     previousWarningCount: recentWarnings.length,
     previousCompletedOrders: completedOrders.length,
     recentHandlingResults: summaries,
@@ -333,6 +354,9 @@ async function buildHistorySummary(nodeId, type) {
       .map(([result, count]) => ({ result, count })),
     lastOccurredAt: recentWarnings[0]?.createdAt,
     lastResolvedAt: recentWarnings[0]?.resolvedAt,
+    lastHandlingResult,
+    lastFieldCondition,
+    avgRepeatIntervalMinutes,
   };
 }
 
@@ -375,6 +399,27 @@ async function getNodeWarningStats(nodeId) {
 
   const allPhotos = completedOrders.flatMap((o) => o.handlingPhotos || []);
 
+  const resolvedWarnings = warnings.filter((w) => w.status === 'resolved');
+  const repIntervals = [];
+  for (let i = 0; i < resolvedWarnings.length - 1; i++) {
+    const diff = new Date(resolvedWarnings[i].createdAt) - new Date(resolvedWarnings[i + 1].createdAt);
+    if (diff > 0) repIntervals.push(diff / (1000 * 60));
+  }
+  const avgRepeatIntervalMinutes = repIntervals.length > 0 ? repIntervals.reduce((a, b) => a + b, 0) / repIntervals.length : null;
+
+  const dailyTrend = {};
+  for (const w of warnings) {
+    const day = new Date(w.createdAt).toISOString().split('T')[0];
+    if (!dailyTrend[day]) dailyTrend[day] = { total: 0, RED: 0, ORANGE: 0, YELLOW: 0 };
+    dailyTrend[day].total++;
+    if (w.level === 'RED') dailyTrend[day].RED++;
+    if (w.level === 'ORANGE') dailyTrend[day].ORANGE++;
+    if (w.level === 'YELLOW') dailyTrend[day].YELLOW++;
+  }
+  const trendList = Object.entries(dailyTrend)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, counts]) => ({ date, ...counts }));
+
   return {
     nodeId,
     nodeName: node.name,
@@ -382,7 +427,7 @@ async function getNodeWarningStats(nodeId) {
     period: '30days',
     totalWarnings: warnings.length,
     activeWarnings: warnings.filter((w) => w.status === 'active').length,
-    resolvedWarnings: warnings.filter((w) => w.status === 'resolved').length,
+    resolvedWarnings: resolvedWarnings.length,
     levelDistribution: {
       RED: warnings.filter((w) => w.level === 'RED').length,
       ORANGE: warnings.filter((w) => w.level === 'ORANGE').length,
@@ -411,6 +456,14 @@ async function getNodeWarningStats(nodeId) {
       handlingResult: o.handlingResult,
       handlingPhotos: o.handlingPhotos,
     })),
+    healthProfile: {
+      dailyTrend: trendList,
+      avgRepeatIntervalMinutes,
+      shortestRepeatIntervalMinutes: repIntervals.length > 0 ? Math.min(...repIntervals) : null,
+      longestRepeatIntervalMinutes: repIntervals.length > 0 ? Math.max(...repIntervals) : null,
+      isFrequentRecurrence: avgRepeatIntervalMinutes !== null && avgRepeatIntervalMinutes < 60,
+      recurrenceRiskLevel: avgRepeatIntervalMinutes === null ? 'none' : avgRepeatIntervalMinutes < 30 ? 'high' : avgRepeatIntervalMinutes < 120 ? 'medium' : 'low',
+    },
   };
 }
 
